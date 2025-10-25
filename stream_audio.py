@@ -2,6 +2,7 @@
 # /// script
 # dependencies = [
 #   "livekit",
+#   "livekit-api",
 #   "sounddevice",
 #   "python-dotenv",
 #   "asyncio",
@@ -16,8 +17,6 @@ import sys
 import time
 import threading
 import select
-import termios
-import tty
 
 from dotenv import load_dotenv
 from signal import SIGINT, SIGTERM
@@ -27,6 +26,12 @@ import sounddevice as sd
 import numpy as np
 from auth import generate_token
 from list_devices import list_audio_devices
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import termios
+    import tty
 
 load_dotenv()
 # ensure LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET are set in your .env file
@@ -208,34 +213,73 @@ class AudioStreamer:
             status = "MUTED" if self.is_muted else "LIVE"
             self.logger.info(f"Microphone {status}")
 
+    def _handle_keypress(self, key: str) -> bool:
+        """Process a single key press; return False to stop the handler."""
+        if not key:
+            return True
+        key_lower = key.lower()
+        if key_lower == 'm':
+            self.toggle_mute()
+        elif key_lower == 'q':
+            self.logger.info("Quit requested by user")
+            self.running = False
+            return False
+        elif key == '\x03':  # Ctrl+C
+            self.logger.info("Ctrl+C detected - stopping keyboard handler")
+            self.running = False
+            return False
+        return True
+
+    def _keyboard_loop_posix(self):
+        """Keyboard handling for POSIX-like systems using termios."""
+        old_settings = None
+        try:
+            if termios is None or tty is None:
+                self.logger.warning("Terminal controls unavailable; keyboard shortcuts disabled")
+                return
+            old_settings = termios.tcgetattr(sys.stdin)
+            tty.setraw(sys.stdin.fileno())
+            while self.running:
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    key = sys.stdin.read(1)
+                    if not self._handle_keypress(key):
+                        break
+        except Exception as e:
+            self.logger.error(f"Keyboard handler error (POSIX): {e}")
+        finally:
+            if old_settings is not None:
+                try:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                except Exception:
+                    pass
+
+    def _keyboard_loop_windows(self):
+        """Keyboard handling for Windows consoles using msvcrt."""
+        if os.name != "nt" or msvcrt is None:
+            self.logger.warning("Windows keyboard handler unavailable; keyboard shortcuts disabled")
+            return
+        try:
+            while self.running:
+                if msvcrt.kbhit():
+                    key = msvcrt.getwch()
+                    if key in ("\x00", "\xe0"):
+                        # Discard special function key prefix
+                        msvcrt.getwch()
+                        continue
+                    if not self._handle_keypress(key):
+                        break
+                else:
+                    time.sleep(0.05)
+        except Exception as e:
+            self.logger.error(f"Keyboard handler error (Windows): {e}")
+
     def start_keyboard_handler(self):
         """Start keyboard input handler in a separate thread"""
         def keyboard_handler():
-            try:
-                # Save original terminal settings
-                old_settings = termios.tcgetattr(sys.stdin)
-                tty.setraw(sys.stdin.fileno())
-                
-                while self.running:
-                    if select.select([sys.stdin], [], [], 0.1)[0]:
-                        key = sys.stdin.read(1)
-                        if key.lower() == 'm':
-                            self.toggle_mute()
-                        elif key.lower() == 'q':
-                            self.logger.info("Quit requested by user")
-                            self.running = False
-                            break
-                        elif key == '\x03':  # Ctrl+C
-                            break
-                            
-            except Exception as e:
-                self.logger.error(f"Keyboard handler error: {e}")
-            finally:
-                # Restore terminal settings
-                try:
-                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-                except:
-                    pass
+            if os.name == "nt":
+                self._keyboard_loop_windows()
+            else:
+                self._keyboard_loop_posix()
         
         self.keyboard_thread = threading.Thread(target=keyboard_handler, daemon=True)
         self.keyboard_thread.start()
@@ -827,8 +871,10 @@ if __name__ == "__main__":
         asyncio.set_event_loop(loop)
         
         main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec))
-        for signal in [SIGINT, SIGTERM]:
-            loop.add_signal_handler(signal, signal_handler)
+
+        if os.name != "nt":
+            for signal in [SIGINT, SIGTERM]:
+                loop.add_signal_handler(signal, signal_handler)
 
         try:
             loop.run_until_complete(main_task)
